@@ -1,0 +1,75 @@
+--1st: Create a new stage to load data from S3
+create or replace stage  "WATERDROP_DB"."RAW"."ETH_STAGE" 
+file_format =  "WATERDROP_DB"."RAW".db_parquet_format 
+url='s3://certik-skynet/chaindata/eth-aggr/'
+credentials=(aws_key_id='***' aws_secret_key='***')
+  encryption=(master_key = '***');
+
+--2nd:Create a table in snowflake to store the data from S3
+
+ create table if not exists "WATERDROP_DB"."RAW"."ETH_RAW"(
+   raw variant default null,
+   metadata_filename VARCHAR(16777216),
+   metadata_file_row_number number(38,0),
+   load_timestamp TIMESTAMP_LTZ(9)
+) cluster by (METADATA_FILENAME);
+
+--3rd:Create Stream to tracking data updating
+
+  create or replace stream eth_blocks on table "WATERDROP_DB"."RAW"."ETH_RAW";
+  create or replace stream eth_txns on table "WATERDROP_DB"."RAW"."ETH_RAW";
+  create or replace stream eth_mtr on table "WATERDROP_DB"."RAW"."ETH_RAW";
+
+--4th:Break down to 3 tables to seperate data
+
+--5th:ingest data manually
+
+--6th:Create task to update table
+
+--7th:if format changed:
+  ## 1. Check the data last ingested timestamp
+       use warehouse worksheet_wh;
+      
+          -- eth_raw the first raw table ,it should always be source data
+            select max(load_timestamp)
+              from "WATERDROP_DB"."RAW"."ETH_RAW"
+                where date(load_timestamp)='2021-09-02'
+                  --2021-09-02 05:06:36.414 -0700  ## changed it into UTC +0700
+      
+          --eth_transactions table
+           select max(to_timestamp(timestamp))
+             from "WATERDROP_DB"."RAW"."ETH_TRANSACTIONS"
+                where date(timestamp) >= '2021-09-01'
+    
+         -- eth_moneytrans table
+          select max(to_timestamp(timestamp))
+              from "WATERDROP_DB"."RAW"."ETH_MONEYTRANS"
+                --@recent date
+                where date(timestamp) >= '2021-09-01'
+                  --2021-09-01 21:43:20.000  UTC
+
+
+  ##2. ingest history data
+  with list[] json format:
+  //*
+  
+  *//
+    insert into ETH_MONEYTRANS
+       select
+        two_level.value:hash::string AS HASH,
+        js_hextoint(raw:timestamp::string)::string AS TIMESTAMP,
+        five_level.value:tokenAddress::string AS TOKENADDRESS,
+        js_hextoint(five_level.value:tokenAmount::string)::string AS TOKENAMOUNT,
+        five_level.value:from::string AS FROM_MT,
+        five_level.value:to::string AS TO_MT
+     
+      from eth_raw,table(flatten(eth_raw.raw:transactions,'list')) as one_level,
+            table(flatten(one_level.value,'')) as two_level,
+            table(flatten(two_level.value:moneyTransfers,'')) as three_level,
+            table(flatten(three_level.value,'')) as four_level,
+            table(flatten(four_level.value,'')) as five_level
+    --from the data changed date   
+      where date(js_hextoint(raw:timestamp::string))>='2021-09-01'
+        ;
+  #2. recreate task
+  
