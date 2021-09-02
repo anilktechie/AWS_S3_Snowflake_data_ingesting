@@ -1,32 +1,305 @@
---1st: Create a new stage to load data from S3
-create or replace stage  "WATERDROP_DB"."RAW"."ETH_STAGE" 
-file_format =  "WATERDROP_DB"."RAW".db_parquet_format 
-url='s3://certik-skynet/chaindata/eth-aggr/'
-credentials=(aws_key_id='***' aws_secret_key='***')
-  encryption=(master_key = '***');
 
---2nd:Create a table in snowflake to store the data from S3
+--STEP 1st:Create a table in snowflake to store the data from S3
 
- create table if not exists "WATERDROP_DB"."RAW"."ETH_RAW"(
+   create table if not exists "WATERDROP_DB"."RAW"."ETH_RAW"(
    raw variant default null,
    metadata_filename VARCHAR(16777216),
    metadata_file_row_number number(38,0),
    load_timestamp TIMESTAMP_LTZ(9)
 ) cluster by (METADATA_FILENAME);
 
---3rd:Create Stream to tracking data updating
 
+--STEP 2nd:Create a STORAGE INTEGRATION for snowpile
+
+    --should use accountadmin role to create
+    USE ROLE "ACCOUNTADMIN";
+    CREATE STORAGE INTEGRATION ETH_RAWDATA
+    TYPE =EXTERNAL_STAGE
+    STORAGE_PROVIDER =S3
+    ENABLED =TRUE
+    STORAGE_AWS_ROLE_ARN ='arn:aws:iam::615007102462:role/Snowpipe-eth-ingest-role'
+    STORAGE_ALLOWED_LOCATIONS =('s3://certik-skynet/chaindata/eth-aggr/');
+  
+  --SHOW INTEGRATIONS;
+  --DESCRIBE INTEGRATION
+    DESC INTEGRATION eth_rawdata;
+    
+    
+--STEP 3rd:Create a STAGE for snowpipe
+
+  create or replace stage "WATERDROP_DB"."RAW"."ETH_STAGE"
+  file_format = "WATERDROP_DB"."PUBLIC"."DB_PARQUET_FORMAT"
+  url ='s3://certik-skynet/chaindata/eth-aggr/'
+   storage_integration = ETH_RAWDATA ;
+ 
+ 
+--STEP 4th:Build a snowpipe for auto ingesting data from S3
+
+  create or replace pipe "WATERDROP_DB"."RAW"."ETH_RAWDATA_PIPE" auto_ingest=true as
+  copy into "WATERDROP_DB"."RAW"."ETH_RAW"
+  from(select
+   $1
+  ,metadata$filename as metadata_filename
+  ,metadata$file_row_number as metadata_file_row_number  
+  ,current_timestamp() as load_timestamp
+  from@"WATERDROP_DB"."RAW"."ETH_STAGE" 
+     )
+  pattern ='^.+\.parquet$';
+     
+  --show pipes;
+
+
+--STEP 5th: Ingest the S3 stage data into raw table 
+
+  use warehouse compute_wh ;
+  COPY INTO "WATERDROP_DB"."RAW"."ETH_RAW" FROM(select
+  $1 AS RAW
+ ,metadata$filename as metadata_filename
+ ,metadata$file_row_number as metadata_file_row_number  
+ ,current_timestamp() as load_timestamp
+        from@"WATERDROP_DB"."RAW"."ETH_STAGE" )
+ pattern ='^.+\.parquet$'
+  file_format =(
+  TYPE ='PARQUET'
+  SNAPPY_COMPRESSION =TRUE)
+  on_error ='skip_file';
+  
+
+--STEP 6th:Break down to 3 tables to seperate data
+
+  --## Create a function to exchange the data format
+  use database "WATERDROP_DB";
+  create or replace function js_hextoint(s string) 
+  returns double language JAVASCRIPT 
+  as
+ 'if (S !== null)
+  {
+   yourNumber = parseInt(S, 16);
+  }
+  return yourNumber';
+
+ ##Case1:
+ ###Create 3 tables under the data format: with list[] json format:
+      //* go to the "list_json_fromat" file to see the example *//
+  
+ --Create table1. eth_transactions
+  
+   create table eth_transactions as
+     select  two_level.value:"hash"::STRING AS hash,
+             two_level.value:"blockHash"::STRING as blockhash, 
+             js_hextoint(two_level.value:"blockNumber")::STRING as blockNumber, 
+             js_hextoint(two_level.value:"transactionIndex")::STRING as transactionIndex,
+             js_hextoint(raw:timestamp)::STRING as timestamp,
+             js_hextoint(two_level.value:"type")::STRING as type, 
+             two_level.value:"from"::STRING as t_from, 
+             two_level.value:"to"::STRING as t_to, 
+             js_hextoint(two_level.value:"input")::STRING as input, 
+             js_hextoint(two_level.value:"nonce")::STRING as nonce, 
+             js_hextoint(two_level.value:"value")::STRING as t_value, 
+             js_hextoint(two_level.value:"gas")::STRING as gas,
+             two_level.value:"r"::STRING as r, 
+             two_level.value:"s"::STRING as s, 
+             js_hextoint(two_level.value:"v")::STRING as v
+        from "WATERDROP_DB"."RAW"."ETH_RAW", 
+             table(flatten("WATERDROP_DB"."RAW"."ETH_RAW".raw:transactions,'list')) as one_level,
+             table(flatten(one_level.value,'')) as two_level
+     ;
+    
+--Table2. eth_moneytrans
+
+   create table eth_moneytrans as
+      select
+            two_level.value:hash::string as hash,
+            js_hextoint(raw:timestamp)::string as timestamp,
+            five_level.value:tokenAddress::string as tokenaddress,
+            js_hextoint(five_level.value:tokenAmount)::string as tokenamount,
+            five_level.value:from::string as from_mt,
+            five_level.value:to::string as to_mt
+     
+       from  eth_raw,table(flatten( eth_raw.raw:transactions,'list')) as one_level,
+            table(flatten(one_level.value,'')) as two_level,
+            table(flatten(two_level.value:moneyTransfers,'')) as three_level,
+            table(flatten(three_level.value,'')) as four_level,
+            table(flatten(four_level.value,'')) as five_level
+            --  where  date(js_hextoint(raw:timestamp))>'2021-08-25'
+        ;
+     
+--Table3 . eth_blocks
+     
+     create table "WATERDROP_DB"."RAW"."ETH_BLOCKS" as 
+          select raw:hash::string as hash,
+                 raw:difficulty::string as difficulty,
+                 js_hextoint(raw:gasLimit::string) as gas_limit,
+                 js_hextoint(raw:gasUsed::string)as gas_used,
+                 raw:extraData::string as extra_data,
+                 raw:logsBloom::string as logs_bloom,
+                 raw:miner::string as miner,
+                 raw:mixHash::string as mix_hash,
+                 raw:nonce::string as nonce,
+                 js_hextoint(raw:number::string)as number,
+                 raw:parentHash::string as parent_hash,
+                 raw:receiptsRoot::string as receipts_root,
+                 raw:sha3Uncles::string as sha_uncles,
+                 js_hextoint(raw:size::string) as size,
+                 raw:stateRoot::string as state_root,
+                 js_hextoint(raw:timestamp::string) as timestamp,
+                 raw:totalDifficulty::string as total_difficulty,
+                 raw:transactionsRoot::string as transactions_root
+            from  "WATERDROP_DB"."RAW"."ETH_RAW";
+            
+  ##Case2:
+  ###Create 3 tables under the data format: without list[] json format:
+      //* go to the "no_list_json_fromat" file to see the example *//
+  
+ --Create table1. eth_transactions
+ --Table2. eth_moneytrans
+ --Table3 . eth_blocks
+     
+  
+--STEP 7th:Create Stream to tracking data updating
+
+ USE ROLE SYSADMIN;
+  USE SCHEMA RAW;
   create or replace stream eth_blocks on table "WATERDROP_DB"."RAW"."ETH_RAW";
   create or replace stream eth_txns on table "WATERDROP_DB"."RAW"."ETH_RAW";
   create or replace stream eth_mtr on table "WATERDROP_DB"."RAW"."ETH_RAW";
 
---4th:Break down to 3 tables to seperate data
 
---5th:ingest data manually
+--STEP 8th:Create task to update table
 
---6th:Create task to update table
+## under the data format: without list[] json format:
+  ##    //* go to the "no_list_json_fromat" file to see the example *//
+  ## if in the case1 ,use above create table format to flatten,and change the from table to stream
+  
+  ##under Case1 :with list
+  use role sysadmin;
+  create or replace task push_ethtxns warehouse =WORKSHEET_WH
+    schedule ='15 minutes'
+    when system$stream_has_data('eth_txns')
+  as
+  insert into "WATERDROP_DB"."RAW"."ETH_TRANSACTIONS" 
+       select  two_level.value:"hash"::STRING AS hash,
+             two_level.value:"blockHash"::STRING as blockhash, 
+             js_hextoint(two_level.value:"blockNumber")::STRING as blockNumber, 
+             js_hextoint(two_level.value:"transactionIndex")::STRING as transactionIndex,
+             js_hextoint(raw:timestamp)::STRING as timestamp,
+             js_hextoint(two_level.value:"type")::STRING as type, 
+             two_level.value:"from"::STRING as t_from, 
+             two_level.value:"to"::STRING as t_to, 
+             js_hextoint(two_level.value:"input")::STRING as input, 
+             js_hextoint(two_level.value:"nonce")::STRING as nonce, 
+             js_hextoint(two_level.value:"value")::STRING as t_value, 
+             js_hextoint(two_level.value:"gas")::STRING as gas,
+             two_level.value:"r"::STRING as r, 
+             two_level.value:"s"::STRING as s, 
+             js_hextoint(two_level.value:"v")::STRING as v
+        from "WATERDROP_DB"."RAW"."ETH_RAW", 
+             table(flatten("WATERDROP_DB"."RAW"."ETH_RAW".raw:transactions,'list')) as one_level,
+             table(flatten(one_level.value,'')) as two_level
+     ;
+  
+##under Case 2 without list
+  
+  use role sysadmin;
+  create or replace task push_ethtxns warehouse =WORKSHEET_WH
+    schedule ='15 minutes'
+    when system$stream_has_data('eth_txns')
+  as
+  insert into "WATERDROP_DB"."RAW"."ETH_TRANSACTIONS" 
+  select one_level.value:"hash"::STRING, 
+         one_level.value:"blockHash"::STRING,
+         js_hextoint(one_level.value:"blockNumber")::STRING,
+         js_hextoint(one_level.value:"transactionIndex")::STRING,
+         js_hextoint(raw:timestamp)::STRING,
+         js_hextoint(one_level.value:"type")::STRING, 
+         one_level.value:"from"::STRING , 
+         one_level.value:"to"::STRING , 
+         js_hextoint(one_level.value:"input")::STRING, 
+         js_hextoint(one_level.value:"nonce")::STRING, 
+         js_hextoint(one_level.value:"value")::STRING, 
+         js_hextoint(one_level.value:"gas")::STRING,
+         one_level.value:"r"::STRING , 
+         one_level.value:"s"::STRING , 
+         js_hextoint(one_level.value:"v")::STRING
 
---7th:if format changed:
+        from eth_txns,
+     table(flatten(eth_txns.raw:transactions,'')) as one_level
+     where date(js_hextoint(raw:timestamp::STRING))
+    ;
+    
+    
+    
+    ##table2
+    ##under Case1 with list
+    create or replace task push_ethmtr warehouse =COMPUTE_WH
+    schedule ='30 minutes'
+    when system$stream_has_data('eth_mtr')
+    as
+      insert into "WATERDROP_DB"."RAW"."ETH_MONEYTRANS"
+         select
+              two_level.value:hash::string,
+              js_hextoint(raw:timestamp::string),
+              five_level.value:tokenAddress::string,
+              js_hextoint(five_level.value:tokenAmount::string),
+              five_level.value:from::string,
+              five_level.value:to::string
+     
+        from  eth_mtr,table(flatten( eth_mtr.raw:transactions,'list')) as one_level,
+              table(flatten(one_level.value,'')) as two_level,
+              table(flatten(two_level.value:moneyTransfers,'')) as three_level,
+              table(flatten(three_level.value,'')) as four_level,
+              table(flatten(four_level.value,'')) as five_level
+       ;
+ 
+    ##under Case2 without list
+       
+    create or replace task push_ethmtr warehouse =COMPUTE_WH
+    schedule ='30 minutes'
+    when system$stream_has_data('eth_mtr')
+    as
+      insert into "WATERDROP_DB"."RAW"."ETH_MONEYTRANS" 
+       select one_level.value:hash::string ,
+              js_hextoint(raw:timestamp)::string ,
+              two_level.value:tokenAddress::string ,
+              js_hextoint(two_level.value:tokenAmount)::string ,
+              two_level.value:from::string ,
+              two_level.value:to::string 
+     
+      from eth_mtr,table(flatten(eth_mtr.RAW,'transactions')) as one_level,
+            table(flatten(one_level.value,'moneyTransfers')) as two_level
+      ;
+      
+      
+      #Table3 . eth_block
+      ##under case1 and case2 
+      
+      create or replace task push_ethmtr warehouse =COMPUTE_WH
+      schedule ='30 minutes'
+      when system$stream_has_data('eth_blocks')
+      as
+      insert into  "WATERDROP_DB"."RAW"."ETH_BLOCKS" as 
+          select raw:hash::string as hash,
+                 raw:difficulty::string as difficulty,
+                 js_hextoint(raw:gasLimit::string) as gas_limit,
+                 js_hextoint(raw:gasUsed::string)as gas_used,
+                 raw:extraData::string as extra_data,
+                 raw:logsBloom::string as logs_bloom,
+                 raw:miner::string as miner,
+                 raw:mixHash::string as mix_hash,
+                 raw:nonce::string as nonce,
+                 js_hextoint(raw:number::string)as number,
+                 raw:parentHash::string as parent_hash,
+                 raw:receiptsRoot::string as receipts_root,
+                 raw:sha3Uncles::string as sha_uncles,
+                 js_hextoint(raw:size::string) as size,
+                 raw:stateRoot::string as state_root,
+                 js_hextoint(raw:timestamp::string) as timestamp,
+                 raw:totalDifficulty::string as total_difficulty,
+                 raw:transactionsRoot::string as transactions_root
+            from  eth_blocks;
+      
+      
+--STEP 9th:if format changed:
   ## 1. Check the data last ingested timestamp
        use warehouse worksheet_wh;
       
@@ -49,27 +322,54 @@ credentials=(aws_key_id='***' aws_secret_key='***')
                   --2021-09-01 21:43:20.000  UTC
 
 
-  ##2. ingest history data
-  with list[] json format:
-  //*
+  ## 2. ingest history data
+   ### with list[] json format:
+      //* go to the "list_json_fromat" file to see the example *//
   
-  *//
-    insert into ETH_MONEYTRANS
-       select
-        two_level.value:hash::string AS HASH,
-        js_hextoint(raw:timestamp::string)::string AS TIMESTAMP,
-        five_level.value:tokenAddress::string AS TOKENADDRESS,
-        js_hextoint(five_level.value:tokenAmount::string)::string AS TOKENAMOUNT,
-        five_level.value:from::string AS FROM_MT,
-        five_level.value:to::string AS TO_MT
+  --ingest into eth_transactions table
+       
+       insert into "WATERDROP_DB"."RAW"."ETH_TRANSACTIONS" 
+            select raw:"hash"::STRING AS hash,
+                   two_level.value:"blockHash"::STRING as blockhash, 
+                   js_hextoint(two_level.value:"blockNumber")::STRING  as blockNumber, 
+                   js_hextoint(two_level.value:"transactionIndex")::STRING  as transactionIndex,
+                   js_hextoint(raw:timestamp)::STRING  as timestamp,
+                   js_hextoint(two_level.value:"type")::STRING  as type, 
+                   two_level.value:"from"::STRING as t_from, 
+                   two_level.value:"to"::STRING as t_to, 
+                   js_hextoint(two_level.value:"input")::STRING  as input, 
+                   js_hextoint(two_level.value:"nonce")::STRING  as nonce, 
+                   js_hextoint(two_level.value:"value")::STRING  as t_value, 
+                   js_hextoint(two_level.value:"gas")::STRING  as gas,
+                   two_level.value:"r"::STRING as r, 
+                   two_level.value:"s"::STRING as s, 
+                   js_hextoint(two_level.value:"v"::STRING)::STRING  as v
+          from eth_raw, 
+             table(flatten(eth_raw.raw:transactions,'list')) as one_level,
+             table(flatten(one_level.value,'')) as two_level
+             ;
+  
+  --ingest into eth_moneytrans table
+   
+      insert into ETH_MONEYTRANS
+           select
+                 two_level.value:hash::string AS HASH,
+                 js_hextoint(raw:timestamp::string)::string AS TIMESTAMP,
+                 five_level.value:tokenAddress::string AS TOKENADDRESS,
+                 js_hextoint(five_level.value:tokenAmount::string)::string AS TOKENAMOUNT,
+                 five_level.value:from::string AS FROM_MT,
+                 five_level.value:to::string AS TO_MT
      
-      from eth_raw,table(flatten(eth_raw.raw:transactions,'list')) as one_level,
-            table(flatten(one_level.value,'')) as two_level,
-            table(flatten(two_level.value:moneyTransfers,'')) as three_level,
-            table(flatten(three_level.value,'')) as four_level,
-            table(flatten(four_level.value,'')) as five_level
-    --from the data changed date   
-      where date(js_hextoint(raw:timestamp::string))>='2021-09-01'
-        ;
-  #2. recreate task
+           from eth_raw,
+              table(flatten(eth_raw.raw:transactions,'list')) as one_level,
+              table(flatten(one_level.value,'')) as two_level,
+              table(flatten(two_level.value:moneyTransfers,'')) as three_level,
+              table(flatten(three_level.value,'')) as four_level,
+              table(flatten(four_level.value,'')) as five_level
+              ;
+              
+ ## 3. recreate task
+ 
+      use the code in step 8th;
+      
   
