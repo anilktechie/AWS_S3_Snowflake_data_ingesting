@@ -329,7 +329,7 @@
   --ingest into eth_transactions table
        
        insert into "WATERDROP_DB"."RAW"."ETH_TRANSACTIONS" 
-            select raw:"hash"::STRING AS hash,
+            select two_level.value:"hash"::STRING AS hash,
                    two_level.value:"blockHash"::STRING as blockhash, 
                    js_hextoint(two_level.value:"blockNumber")::STRING  as blockNumber, 
                    js_hextoint(two_level.value:"transactionIndex")::STRING  as transactionIndex,
