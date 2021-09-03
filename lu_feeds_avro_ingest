@@ -1,0 +1,79 @@
+--Create S3 Stage
+
+  create or replace stage "WATERDROP_DB"."RAW"."LU_FEEDS_STAGE"
+  file_format = "WATERDROP_DB"."PUBLIC"."MYAVROFORMAT"
+  url ='s3://certik-skynet/chain-data-dump/lu-feeds.avro'
+ credentials=(aws_key_id='***' aws_secret_key='***')
+  encryption=(master_key = '***');
+  
+  
+--ingest data into table
+  copy into "WATERDROP_DB"."RAW"."LU_FEEDS"
+  from(select
+   $1 
+  ,current_timestamp() 
+  from@"WATERDROP_DB"."RAW"."LU_FEEDS_STAGE" 
+     )
+  file_format =(
+  TYPE ='AVRO'
+  SNAPPY_COMPRESSION =TRUE)
+  on_error ='skip_file';
+  
+  
+--build STORAGE INTEGRATION
+
+    USE ROLE "ACCOUNTADMIN";
+    CREATE STORAGE INTEGRATION LU_FEEDS_J
+    TYPE =EXTERNAL_STAGE
+    STORAGE_PROVIDER =S3
+    ENABLED =TRUE
+    STORAGE_AWS_ROLE_ARN ='arn:aws:iam::615007102462:role/mysnowflakerole'
+    --'arn:aws:iam::615007102462:role/Snowpipe-eth-ingest-role'
+    STORAGE_ALLOWED_LOCATIONS =('s3://certik-skynet/chain-data-dump/lu-feeds.avro');
+   
+    DESC INTEGRATION LU_FEEDS_J;
+    
+--Set Snowpipe stage
+
+  USE ROLE ACCOUNTADMIN;
+  create or replace stage "WATERDROP_DB"."RAW"."LU_FEEDS_STAGE"
+  file_format = "WATERDROP_DB"."PUBLIC"."MYAVROFORMAT"
+  url ='s3://certik-skynet/chain-data-dump/lu-feeds.avro'
+   storage_integration = LU_FEEDS_J ;  
+ 
+--Create Snowpipe
+
+   use role sysadmin;
+   create or replace pipe "WATERDROP_DB"."RAW"."LU_FEEDS_J_PIPE" auto_ingest=true as
+copy into "WATERDROP_DB"."RAW"."LU_FEEDS"
+from(select
+  $1
+ ,current_timestamp() 
+  from@"WATERDROP_DB"."RAW"."LU_FEEDS_STAGE" 
+     )
+ ;
+     
+--Set stream and task
+
+create or replace stream lu_feeds_stream on table  "WATERDROP_DB"."RAW"."LU_FEEDS";
+ CREATE or replace TASK lu_feeds_task 
+    warehouse = COMPUTE_WH
+  SCHEDULE = 'USING CRON 0 23 * * * UTC'
+  when system$stream_has_data('lu_feeds_stream')
+AS
+ insert into  "WATERDROP_DB"."RAW"."LU_FEEDS_NEW"
+  select 
+        JS:projectId as projectid,
+        JS:id as id,
+        JS:address as address,
+        privilege.value:"label"::STRING as label,
+        privilege.value:"address"::STRING as label_address,
+        JS:name as name,
+        JS:url as url,
+        current_timestamp() as update_time
+        
+  from waterdrop_db.raw.lu_feeds_stream ,
+        table(flatten(lu_feeds_stream.JS:privilegedAddresses,'')) as privilege  
+  ;
+  alter task lu_feeds_task resume;
+  
