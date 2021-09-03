@@ -1,0 +1,79 @@
+
+create table if not exists eth_txn_deep_cs like eth_transactions;
+create table if not exists eth_mf_deep_cs like eth_moneytrans;
+
+create or replace stream eth_txn_deep_cs_stream on table eth_raw;
+create or replace stream eth_mf_deep_cs_stream on table eth_raw;
+show streams;
+
+create task push_ethtxn_deep_cs_task
+    warehouse = COMPUTE_WH
+    schedule = '60 minutes'
+    when system$stream_has_data('eth_txn_deep_cs_stream')
+    as
+insert into "WATERDROP_DB"."RAW"."ETH_TXN_DEEP_CS" 
+
+select       two_level.value:"hash"::STRING AS hash,
+             two_level.value:"blockHash"::STRING as blockhash, 
+             js_hextoint(two_level.value:"blockNumber")::STRING as blockNumber, 
+             js_hextoint(two_level.value:"transactionIndex")::STRING as transactionIndex,
+             js_hextoint(raw:timestamp)::STRING as timestamp,
+             js_hextoint(two_level.value:"type")::STRING as type, 
+             two_level.value:"from"::STRING as t_from, 
+             two_level.value:"to"::STRING as t_to, 
+             js_hextoint(two_level.value:"input")::STRING as input, 
+             js_hextoint(two_level.value:"nonce")::STRING as nonce, 
+             js_hextoint(two_level.value:"value")::STRING as t_value, 
+             js_hextoint(two_level.value:"gas")::STRING as gas,
+             two_level.value:"r"::STRING as r, 
+             two_level.value:"s"::STRING as s, 
+             js_hextoint(two_level.value:"v")::STRING as v
+        from eth_txn_deep_cs_stream,
+             table(flatten(eth_txn_deep_cs_stream.raw:transactions,'list')) as one_level,
+             table(flatten(one_level.value,'')) as two_level;
+alter task push_ethtxn_deep_cs_task resume;
+
+insert into "WATERDROP_DB"."RAW"."ETH_TXN_DEEP_CS" 
+ select  two_level.value:"hash"::STRING AS hash,
+             two_level.value:"blockHash"::STRING as blockhash, 
+             js_hextoint(two_level.value:"blockNumber")::STRING as blockNumber, 
+             js_hextoint(two_level.value:"transactionIndex")::STRING as transactionIndex,
+             js_hextoint(raw:timestamp)::STRING as timestamp,
+             js_hextoint(two_level.value:"type")::STRING as type, 
+             two_level.value:"from"::STRING as t_from, 
+             two_level.value:"to"::STRING as t_to, 
+             js_hextoint(two_level.value:"input")::STRING as input, 
+             js_hextoint(two_level.value:"nonce")::STRING as nonce, 
+             js_hextoint(two_level.value:"value")::STRING as t_value, 
+             js_hextoint(two_level.value:"gas")::STRING as gas,
+             two_level.value:"r"::STRING as r, 
+             two_level.value:"s"::STRING as s, 
+             js_hextoint(two_level.value:"v")::STRING as v
+        from "WATERDROP_DB"."RAW"."ETH_RAW", 
+             table(flatten("WATERDROP_DB"."RAW"."ETH_RAW".raw:transactions,'list')) as one_level,
+             table(flatten(one_level.value,'')) as two_level;
+--eth_moneytrans_flat表同步
+create task push_ethmf_deep_cs_task
+    warehouse = compute_wh
+    schedule = '60 minute'
+    when system$stream_has_data('eth_mf_deep_cs_stream')
+    as
+  insert into "WATERDROP_DB"."RAW"."ETH_MF_DEEP_CS" 
+      select
+              two_level.value:hash::string,
+              js_hextoint(raw:timestamp)::string,
+              five_level.value:tokenAddress::string,
+              js_hextoint(five_level.value:tokenAmount)::string,
+              five_level.value:from::string,
+              five_level.value:to::string
+     
+        from  eth_mf_deep_cs_stream,
+              table(flatten( eth_mf_deep_cs_stream.raw:transactions,'list')) as one_level,
+              table(flatten(one_level.value,'')) as two_level,
+              table(flatten(two_level.value:moneyTransfers,'')) as three_level,
+              table(flatten(three_level.value,'')) as four_level,
+              table(flatten(four_level.value,'')) as five_level
+    ;
+
+alter task push_ethmf_deep_cs_task resume;
+
