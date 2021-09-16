@@ -1,0 +1,460 @@
+use role accountadmin
+grant  CHANGE_TRACKING  on all tables in schema analyze to role sysadmin;
+use role sysadmin;
+use schema analyze;
+show tasks;
+
+drop table "WATERDROP_DB"."ANALYZE".BSC_MONEY_INFLOW_BY_DATE ;
+drop table  "WATERDROP_DB"."ANALYZE".BSC_MONEY_OUTFLOW_BY_DATE;
+drop table "WATERDROP_DB"."ANALYZE".BSC_MONEY_NETFLOW_BY_DATE ;
+drop table "WATERDROP_DB"."ANALYZE"."BSC_CUMUL_NETFLOW_TO_DATE";
+drop table "WATERDROP_DB"."ANALYZE"."BSC_TOKENS";
+drop table "WATERDROP_DB"."ANALYZE".ETH_MONEY_INFLOW_BY_DATE ;
+drop table  "WATERDROP_DB"."ANALYZE".ETH_MONEY_OUTFLOW_BY_DATE;
+drop table "WATERDROP_DB"."ANALYZE".ETH_MONEY_NETFLOW_BY_DATE ;
+drop table "WATERDROP_DB"."ANALYZE"."ETH_CUMUL_NETFLOW_TO_DATE";
+drop table "WATERDROP_DB"."ANALYZE"."ETH_TOKENS";
+use role accountadmin;
+use schema analyze;
+show streams;
+drop stream BSC_INFLOW_INGEST_STREAM;
+drop stream BSC_NETFLOW_CUMUL_INGEST_STREAM;
+drop stream BSC_NETFLOW_INGEST_STREAM;
+drop stream BSC_OUTFLOW_INGEST_STREAM;
+drop stream BSC_TOKEN_INGEST_STREAM;
+drop stream ETH_INFLOW_INGEST_STREAM;
+drop stream ETH_NETFLOW_CUMUL_INGEST_STREAM;
+drop stream ETH_NETFLOW_INGEST_STREAM;
+drop stream ETH_OUTFLOW_INGEST_STREAM;
+drop stream ETH_TOKEN_INGEST_STREAM;
+use role sysadmin;
+
+
+create or replace table "WATERDROP_DB"."ANALYZE".BSC_MONEY_INFLOW_BY_DATE  ( token_address string, to_address string, date string, inflow real , update_time timestamp);
+create or replace table "WATERDROP_DB"."ANALYZE".BSC_MONEY_OUTFLOW_BY_DATE ( token_address string, from_address string, date string, outflow real ,update_time timestamp);
+create or replace table "WATERDROP_DB"."ANALYZE".BSC_MONEY_NETFLOW_BY_DATE ( token_address string, address string, date string, inflow real, outflow real, netflow real,update_time timestamp );
+
+insert into "WATERDROP_DB"."ANALYZE".BSC_MONEY_INFLOW_BY_DATE
+select tokenaddress as token_address, to_mt as to_address, date(timestamp) as date, sum(tokenamount::real) as inflow ,current_timestamp() as update_time
+from raw.bsc_moneytransfers
+where tokenamount != 'NaN'
+group by tokenaddress, to_mt, date;
+
+insert into "WATERDROP_DB"."ANALYZE".BSC_MONEY_OUTFLOW_BY_DATE
+select tokenaddress as token_address, from_mt as frome_address, date(timestamp) as date, sum(tokenamount::real) as outflow,current_timestamp() as update_time
+from raw.bsc_moneytransfers
+where tokenamount != 'NaN'
+group by tokenaddress, from_mt, date;
+
+insert into "WATERDROP_DB"."ANALYZE".BSC_MONEY_NETFLOW_BY_DATE
+select
+    iff(a.token_address is not null, a.token_address, b.token_address) as token_address,
+    iff(a.from_address is not null, a.from_address, b.to_address) as address,
+    iff(a.date is not null, a.date, b.date) as date,
+    iff(a.outflow is null, 0, a.outflow) as outflow,
+    iff(b.inflow is null, 0, b.inflow) as inflow,
+    iff(a.outflow is null, b.inflow, iff(b.inflow is null, -a.outflow, b.inflow - a.outflow)) as netflow,current_timestamp() as update_time
+from
+    "WATERDROP_DB"."ANALYZE".BSC_MONEY_OUTFLOW_BY_DATE a FULL OUTER JOIN  "WATERDROP_DB"."ANALYZE".BSC_MONEY_INFLOW_BY_DATE b
+    on a.from_address = b.to_address and a.token_address = b.token_address and a.date = b.date;
+
+--create stream to update data
+create or replace stream ANALYZE.bsc_inflow_ingest_stream on table raw.bsc_moneytransfers;
+create or replace stream ANALYZE.bsc_outflow_ingest_stream on table raw.bsc_moneytransfers;
+create or replace stream ANALYZE.bsc_netflow_ingest_stream on table ANALYZE.BSC_MONEY_INFLOW_BY_DATE;
+
+    create or replace task analyze.bsc_inflow_ingest_task 
+    warehouse = COMPUTE_WH
+    schedule = '60 minutes'
+    when system$stream_has_data('ANALYZE.bsc_inflow_ingest_stream')
+as
+    insert into "WATERDROP_DB"."ANALYZE".BSC_MONEY_INFLOW_BY_DATE
+     select 
+    token_address,
+    to_address,
+    date,
+    inflow,
+    current_timestamp as update_time
+     from ANALYZE.bsc_inflow_ingest_stream where token_address is not null;
+
+ create or replace task analyze.bsc_outflow_ingest_task 
+    warehouse = COMPUTE_WH
+    schedule = '60 minutes'
+    when system$stream_has_data('ANALYZE.bsc_outflow_ingest_stream')
+as
+    insert into "WATERDROP_DB"."ANALYZE".BSC_MONEY_OUTFLOW_BY_DATE
+     select 
+    token_address,
+    from_address,
+    date,
+    outflow,
+    current_timestamp as update_time
+     from ANALYZE.bsc_outflow_ingest_stream where token_address is not null;
+
+create or replace task analyze.bsc_netflow_ingest_task 
+    warehouse = COMPUTE_WH
+    schedule = '60 minutes'
+    when system$stream_has_data('ANALYZE.bsc_netflow_ingest_stream')
+as
+    insert into "WATERDROP_DB"."ANALYZE".BSC_MONEY_NETFLOW_BY_DATE
+     select 
+    token_address,
+    address,
+    date,
+    outflow,
+    inflow,
+    netflow,
+    current_timestamp as update_time
+     from ANALYZE.bsc_netflow_ingest_stream where token_address is not null;
+     
+     alter task analyze.bsc_inflow_ingest_task resume;
+      alter task analyze.bsc_outflow_ingest_task resume;
+      alter task analyze.bsc_netflow_ingest_task resume;
+     
+   
+-- compute total token flow by token, address and date | BSC
+
+create or replace table "WATERDROP_DB"."ANALYZE".ETH_MONEY_INFLOW_BY_DATE  ( token_address string, to_address string, date string, inflow real,update_time timestamp);
+create or replace table "WATERDROP_DB"."ANALYZE".ETH_MONEY_OUTFLOW_BY_DATE ( token_address string, from_address string, date string, outflow real,update_time timestamp );
+create or replace table "WATERDROP_DB"."ANALYZE".ETH_MONEY_NETFLOW_BY_DATE ( token_address string, address string, date string, inflow real, outflow real, netflow real,update_time timestamp);
+
+insert into "WATERDROP_DB"."ANALYZE".ETH_MONEY_INFLOW_BY_DATE
+select tokenaddress as token_address, to_mt as to_address, date(timestamp) as date, sum(tokenamount::real) as inflow,current_timestamp() as update_time
+from raw.eth_moneytrans
+where tokenamount != 'NaN'
+group by tokenaddress, to_mt, date;
+
+insert into "WATERDROP_DB"."ANALYZE".ETH_MONEY_OUTFLOW_BY_DATE
+select tokenaddress as token_address, from_mt as frome_address, date(timestamp) as date, sum(tokenamount::real) as outflow,current_timestamp() as update_time
+from raw.eth_moneytrans
+where tokenamount != 'NaN'
+group by tokenaddress, from_mt, date;
+
+insert into "WATERDROP_DB"."ANALYZE".eth_MONEY_NETFLOW_BY_DATE
+select
+    iff(a.token_address is not null, a.token_address, b.token_address) as token_address,
+    iff(a.from_address is not null, a.from_address, b.to_address) as address,
+    iff(a.date is not null, a.date, b.date) as date,
+    iff(a.outflow is null, 0, a.outflow) as outflow,
+    iff(b.inflow is null, 0, b.inflow) as inflow,
+    iff(a.outflow is null, b.inflow, iff(b.inflow is null, -a.outflow, b.inflow - a.outflow)) as netflow,current_timestamp() as update_time
+from
+    "WATERDROP_DB"."ANALYZE".eth_MONEY_OUTFLOW_BY_DATE a FULL OUTER JOIN  "WATERDROP_DB"."ANALYZE".eth_MONEY_INFLOW_BY_DATE b
+    on a.from_address = b.to_address and a.token_address = b.token_address and a.date = b.date;
+
+
+  
+--create stream to update data
+create or replace stream ANALYZE.eth_inflow_ingest_stream on table raw.eth_moneytrans;
+create or replace stream ANALYZE.eth_outflow_ingest_stream on table raw.eth_moneytrans;
+create or replace stream ANALYZE.eth_netflow_ingest_stream on table ANALYZE.ETH_MONEY_INFLOW_BY_DATE;
+
+    create or replace task analyze.eth_inflow_ingest_task 
+    warehouse = COMPUTE_WH
+    schedule = '60 minutes'
+    when system$stream_has_data('ANALYZE.eth_inflow_ingest_stream')
+as
+    insert into "WATERDROP_DB"."ANALYZE".ETH_MONEY_INFLOW_BY_DATE
+     select 
+    token_address,
+    to_address,
+    date,
+    inflow,
+    current_timestamp  as update_time
+     from ANALYZE.eth_inflow_ingest_stream where token_address is not null;
+
+ create or replace task analyze.eth_outflow_ingest_task 
+    warehouse = COMPUTE_WH
+    schedule = '60 minutes'
+    when system$stream_has_data('ANALYZE.eth_outflow_ingest_stream')
+as
+    insert into "WATERDROP_DB"."ANALYZE".ETH_MONEY_OUTFLOW_BY_DATE
+     select 
+    token_address,
+    from_address,
+    date,
+    outflow,
+    current_timestamp  as update_time
+     from ANALYZE.eth_outflow_ingest_stream where token_address is not null;
+
+create or replace task analyze.eth_netflow_ingest_task 
+    warehouse = COMPUTE_WH
+    schedule = '60 minutes'
+    when system$stream_has_data('ANALYZE.eth_netflow_ingest_stream')
+as
+    insert into "WATERDROP_DB"."ANALYZE".ETH_MONEY_NETFLOW_BY_DATE
+     select 
+    token_address,
+    address,
+    date,
+    outflow,
+    inflow,
+    netflow,
+    current_timestamp  as update_time
+     from ANALYZE.eth_netflow_ingest_stream where token_address is not null;
+
+      alter task analyze.eth_inflow_ingest_task resume;
+      alter task analyze.eth_outflow_ingest_task resume;
+      alter task analyze.eth_netflow_ingest_task resume;
+     
+
+-- compute cumulative money flow
+
+create or replace table "WATERDROP_DB"."ANALYZE".ETH_CUMUL_NETFLOW_TO_DATE  ( token_address string, address string, date string, cumul_netflow real,update_time timestamp);
+create or replace table "WATERDROP_DB"."ANALYZE".BSC_CUMUL_NETFLOW_TO_DATE  ( token_address string, address string, date string, cumul_netflow real,update_time timestamp);
+
+insert into "WATERDROP_DB"."ANALYZE".BSC_CUMUL_NETFLOW_TO_DATE
+select token_address, address, date(dateadd(day, -1, current_timestamp)) as date, sum(netflow) as cumul_netflow,current_timestamp as update_time
+from "WATERDROP_DB"."ANALYZE".BSC_MONEY_NETFLOW_BY_DATE
+where date <= date(dateadd(day, -1, current_timestamp))
+group by token_address, address;
+
+insert into "WATERDROP_DB"."ANALYZE".ETH_CUMUL_NETFLOW_TO_DATE
+select token_address, address, date(dateadd(day, -1, current_timestamp)) as date, sum(netflow) as cumul_netflow,current_timestamp as update_time
+from "WATERDROP_DB"."ANALYZE".ETH_MONEY_NETFLOW_BY_DATE
+where date <= date(dateadd(day, -1, current_timestamp))
+group by token_address, address;
+
+
+create or replace stream ANALYZE.bsc_netflow_cumul_ingest_stream on table ANALYZE.BSC_MONEY_NETFLOW_BY_DATE;
+create or replace stream ANALYZE.eth_netflow_cumul_ingest_stream on table ANALYZE.ETH_MONEY_NETFLOW_BY_DATE;
+
+    create or replace task analyze.bsc_netflow_cumul_ingest_task 
+    warehouse = COMPUTE_WH
+    schedule = '60 minutes'
+    when system$stream_has_data('ANALYZE.bsc_netflow_cumul_ingest_stream')
+as
+    insert into "WATERDROP_DB"."ANALYZE".BSC_CUMUL_NETFLOW_TO_DATE
+     select 
+    token_address,
+    address,
+    date,
+    cumul_netflow,
+    current_timestamp  as update_time
+     from ANALYZE.bsc_netflow_cumul_ingest_stream where token_address is not null;
+
+create or replace task analyze.eth_netflow_cumul_ingest_task 
+    warehouse = COMPUTE_WH
+    schedule = '60 minutes'
+    when system$stream_has_data('ANALYZE.eth_netflow_cumul_ingest_stream')
+as
+    insert into "WATERDROP_DB"."ANALYZE".ETH_CUMUL_NETFLOW_TO_DATE
+     select 
+    token_address,
+    address,
+    date,
+    cumul_netflow,
+    current_timestamp  as update_time
+     from ANALYZE.eth_netflow_cumul_ingest_stream where token_address is not null;
+
+alter task analyze.eth_netflow_cumul_ingest_task resume;
+alter task analyze.bsc_netflow_cumul_ingest_task resume;
+ 
+
+
+-- compute token supply
+
+create or replace table "WATERDROP_DB"."ANALYZE".BSC_TOKENS  ( token_address string, token_supply real, price_7_23 real, decimals number, token_name string, token_symbol string ,update_time timestamp);
+create or replace table "WATERDROP_DB"."ANALYZE".ETH_TOKENS  ( token_address string, token_supply real, price_7_23 real, decimals number, token_name string, token_symbol string ,update_time timestamp);
+
+insert into "WATERDROP_DB"."ANALYZE".bsc_tokens
+select ttoken.token_address as token_address, ttoken.token_supply as token_supply, 
+ttoken.price_7_23 as price_7_23, tlabel.decimals as decimals, token_name as token_name, token_symbol as token_symbol,current_timestamp
+from
+    (select tsupply.token_address as token_address, tsupply.token_supply as token_supply, tprices.price as price_7_23
+    from
+        (select a.tokenaddress as token_address, iff(b.burn is not null, a.mint - b.burn, a.mint) as token_supply
+        from
+        (select tokenaddress, sum(tokenamount) as mint from raw.bsc_moneytransfers
+         where from_mt = '0x0000000000000000000000000000000000000000' and 
+         tokenaddress != '0x0000000000000000000000000000000000000000' group by tokenaddress) a
+        left join
+        (select tokenaddress, sum(tokenamount) as burn 
+         from raw.bsc_moneytransfers where to_mt = '0x0000000000000000000000000000000000000000' and
+         tokenaddress != '0x0000000000000000000000000000000000000000' group by tokenaddress) b
+        on a.tokenaddress = b.tokenaddress) tsupply
+    left join
+        (select substring(address, 5, 100) as token_address, price 
+         from public.skynet_prd_token_prices
+         where date(timestamp) = '2021-07-23' and startswith(address, 'bsc:')) tprices
+    on tsupply.token_address = tprices.token_address) ttoken
+left join
+    (select substring(address, 5, 100) as token_address, 
+     decimals, name as token_name, symbol as token_symbol 
+     from public.skynet_prd_tokens where startswith(address, 'bsc:')) tlabel
+on ttoken.token_address = tlabel.token_address;
+
+insert into "WATERDROP_DB"."ANALYZE".eth_tokens
+select ttoken.token_address as token_address, ttoken.token_supply as token_supply, 
+ttoken.price_7_23 as price_7_23, tlabel.decimals as decimals, 
+token_name as token_name, token_symbol as token_symbol,current_timestamp
+from
+    (select tsupply.token_address as token_address, tsupply.token_supply as token_supply, tprices.price as price_7_23
+    from
+        (select a.tokenaddress as token_address, iff(b.burn is not null, a.mint - b.burn, a.mint) as token_supply
+        from
+        (select tokenaddress, sum(tokenamount) as mint from raw.eth_moneytrans 
+         where from_mt = '0x0000000000000000000000000000000000000000' and tokenaddress != '0x0000000000000000000000000000000000000000' group by tokenaddress) a
+        left join
+        (select tokenaddress, sum(tokenamount) as burn from raw.eth_moneytrans 
+         where to_mt = '0x0000000000000000000000000000000000000000' and tokenaddress != '0x0000000000000000000000000000000000000000' group by tokenaddress) b
+        on a.tokenaddress = b.tokenaddress) tsupply
+    left join
+        (select substring(address, 5, 100) as token_address, price from public.skynet_prd_token_prices where date(timestamp) = '2021-07-23' and startswith(address, 'eth:')) tprices
+    on tsupply.token_address = tprices.token_address) ttoken
+left join
+    (select substring(address, 5, 100) as token_address, decimals, name as token_name, symbol as token_symbol 
+     from public.skynet_prd_tokens where startswith(address, 'eth:')) tlabel
+on ttoken.token_address = tlabel.token_address;
+
+create or replace stream ANALYZE.eth_token_ingest_stream on table raw.eth_moneytrans;
+create or replace stream ANALYZE.bsc_token_ingest_stream on table raw.bsc_moneytransfers;
+
+create or replace task analyze.eth_token_ingest_task 
+    warehouse = COMPUTE_WH
+    schedule = '60 minutes'
+    when system$stream_has_data('ANALYZE.eth_token_ingest_stream')
+as
+    insert into "WATERDROP_DB"."ANALYZE".eth_tokens
+    select ttoken.token_address as token_address, ttoken.token_supply as token_supply, 
+ttoken.price_7_23 as price_7_23, tlabel.decimals as decimals, 
+token_name as token_name, token_symbol as token_symbol,current_timestamp
+from
+    (select tsupply.token_address as token_address, tsupply.token_supply as token_supply, tprices.price as price_7_23
+    from
+        (select a.tokenaddress as token_address, iff(b.burn is not null, a.mint - b.burn, a.mint) as token_supply
+        from
+        (select tokenaddress, sum(tokenamount) as mint from ANALYZE.eth_token_ingest_stream 
+         where from_mt = '0x0000000000000000000000000000000000000000' and tokenaddress != '0x0000000000000000000000000000000000000000' group by tokenaddress) a
+        left join
+        (select tokenaddress, sum(tokenamount) as burn from ANALYZE.eth_token_ingest_stream 
+         where to_mt = '0x0000000000000000000000000000000000000000' and tokenaddress != '0x0000000000000000000000000000000000000000' group by tokenaddress) b
+        on a.tokenaddress = b.tokenaddress) tsupply
+    left join
+        (select substring(address, 5, 100) as token_address, price from public.skynet_prd_token_prices where date(timestamp) = '2021-07-23' and startswith(address, 'eth:')) tprices
+    on tsupply.token_address = tprices.token_address) ttoken
+left join
+    (select substring(address, 5, 100) as token_address, decimals, name as token_name, symbol as token_symbol 
+     from public.skynet_prd_tokens where startswith(address, 'eth:')) tlabel
+on ttoken.token_address = tlabel.token_address;
+
+
+
+create or replace task analyze.bsc_token_ingest_task 
+    warehouse = COMPUTE_WH
+    schedule = '60 minutes'
+    when system$stream_has_data('ANALYZE.bsc_token_ingest_stream')
+as
+    insert into "WATERDROP_DB"."ANALYZE".eth_tokens
+  select ttoken.token_address as token_address, ttoken.token_supply as token_supply, 
+ttoken.price_7_23 as price_7_23, tlabel.decimals as decimals, token_name as token_name, token_symbol as token_symbol,current_timestamp
+from
+    (select tsupply.token_address as token_address, tsupply.token_supply as token_supply, tprices.price as price_7_23
+    from
+        (select a.tokenaddress as token_address, iff(b.burn is not null, a.mint - b.burn, a.mint) as token_supply
+        from
+        (select tokenaddress, sum(tokenamount) as mint from ANALYZE.bsc_token_ingest_stream
+         where from_mt = '0x0000000000000000000000000000000000000000' and 
+         tokenaddress != '0x0000000000000000000000000000000000000000' group by tokenaddress) a
+        left join
+        (select tokenaddress, sum(tokenamount) as burn 
+         from ANALYZE.bsc_token_ingest_stream where to_mt = '0x0000000000000000000000000000000000000000' and
+         tokenaddress != '0x0000000000000000000000000000000000000000' group by tokenaddress) b
+        on a.tokenaddress = b.tokenaddress) tsupply
+    left join
+        (select substring(address, 5, 100) as token_address, price 
+         from public.skynet_prd_token_prices
+         where date(timestamp) = '2021-07-23' and startswith(address, 'bsc:')) tprices
+    on tsupply.token_address = tprices.token_address) ttoken
+left join
+    (select substring(address, 5, 100) as token_address, 
+     decimals, name as token_name, symbol as token_symbol 
+     from public.skynet_prd_tokens where startswith(address, 'bsc:')) tlabel
+on ttoken.token_address = tlabel.token_address;
+
+alter task analyze.bsc_token_ingest_task  resume;
+alter task analyze.eth_token_ingest_task  resume;
+
+
+
+
+
+-- compute % of tokens owned by each wallet
+
+create or replace table "WATERDROP_DB"."ANALYZE".BSC_wallets  ( token_address string, token_name string, address string, date string, ratio real, balance real, token_supply real,update_time timestamp );
+create or replace table "WATERDROP_DB"."ANALYZE".ETH_wallets  ( token_address string, token_name string, address string, date string, ratio real, balance real, token_supply real,update_time timestamp );
+
+insert into "WATERDROP_DB"."ANALYZE".bsc_wallets
+select
+    tbalance.token_address as token_address, ttokens.token_name as token_name, tbalance.address as address, tbalance.date as date,
+    tbalance.cumul_netflow / ttokens.token_supply as ratio,
+    tbalance.cumul_netflow / pow(10, ttokens.decimals) as balance,
+    ttokens.token_supply / pow(10, ttokens.decimals) as token_supply,current_timestamp() as update_time
+from
+  (select * from "WATERDROP_DB"."ANALYZE".bsc_cumul_netflow_to_date) tbalance
+  join
+  (select * from "WATERDROP_DB"."ANALYZE".bsc_tokens) ttokens
+  on tbalance.token_address = ttokens.token_address
+  where ttokens.token_supply > 0 and ttokens.token_name is not null and tbalance.address != '0x0000000000000000000000000000000000000000'
+;
+
+insert into "WATERDROP_DB"."ANALYZE".eth_wallets
+select
+    tbalance.token_address as token_address, 
+    ttokens.token_name as token_name, 
+    tbalance.address as address, 
+    tbalance.date as date,
+    tbalance.cumul_netflow / ttokens.token_supply as ratio,
+    tbalance.cumul_netflow / pow(10, ttokens.decimals) as balance,
+    ttokens.token_supply / pow(10, ttokens.decimals) as token_supply,current_timestamp() as update_time
+from
+  (select * from "WATERDROP_DB"."ANALYZE".eth_cumul_netflow_to_date) tbalance
+  join
+  (select * from "WATERDROP_DB"."ANALYZE".eth_tokens) ttokens
+  on tbalance.token_address = ttokens.token_address
+  where ttokens.token_supply > 0 and ttokens.token_name is not null 
+  and tbalance.address != '0x0000000000000000000000000000000000000000'
+ ;
+ 
+ create stream analyze.eth_wallets_stream on table "ANALYZE".eth_cumul_netflow_to_date;
+  create stream analyze.bsc_wallets_stream on table "ANALYZE".bsc_cumul_netflow_to_date;
+ 
+ create or replace task analyze.bsc_wallets_ingest_task 
+    warehouse = COMPUTE_WH
+    schedule = '60 minutes'
+    when system$stream_has_data('ANALYZE.bsc_wallets_stream')
+as
+    insert into "WATERDROP_DB"."ANALYZE".bsc_wallets
+    select
+    tbalance.token_address as token_address, ttokens.token_name as token_name, tbalance.address as address, tbalance.date as date,
+    tbalance.cumul_netflow / ttokens.token_supply as ratio,
+    tbalance.cumul_netflow / pow(10, ttokens.decimals) as balance,
+    ttokens.token_supply / pow(10, ttokens.decimals) as token_supply,current_timestamp() as update_time
+from
+  (select * from "WATERDROP_DB"."ANALYZE".bsc_wallets_stream) tbalance
+  join
+  (select * from "WATERDROP_DB"."ANALYZE".bsc_tokens) ttokens
+  on tbalance.token_address = ttokens.token_address
+  where ttokens.token_supply > 0 and ttokens.token_name is not null and tbalance.address != '0x0000000000000000000000000000000000000000'
+;
+
+create or replace task analyze.eth_wallets_ingest_task 
+    warehouse = COMPUTE_WH
+    schedule = '60 minutes'
+    when system$stream_has_data('ANALYZE.eth_wallets_stream')
+as
+    insert into "WATERDROP_DB"."ANALYZE".eth_wallets
+    select
+    tbalance.token_address as token_address, ttokens.token_name as token_name, tbalance.address as address, tbalance.date as date,
+    tbalance.cumul_netflow / ttokens.token_supply as ratio,
+    tbalance.cumul_netflow / pow(10, ttokens.decimals) as balance,
+    ttokens.token_supply / pow(10, ttokens.decimals) as token_supply,current_timestamp() as update_time
+from
+  (select * from "WATERDROP_DB"."ANALYZE".eth_wallets_stream) tbalance
+  join
+  (select * from "WATERDROP_DB"."ANALYZE".eth_tokens) ttokens
+  on tbalance.token_address = ttokens.token_address
+  where ttokens.token_supply > 0 and ttokens.token_name is not null and tbalance.address != '0x0000000000000000000000000000000000000000'
+;
+alter task analyze.eth_wallets_ingest_task  resume;
+alter task analyze.bsc_wallets_ingest_task  resume;
