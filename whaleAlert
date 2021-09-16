@@ -1,33 +1,3 @@
-use role accountadmin
-grant  CHANGE_TRACKING  on all tables in schema analyze to role sysadmin;
-use role sysadmin;
-use schema analyze;
-show tasks;
-
-drop table "WATERDROP_DB"."ANALYZE".BSC_MONEY_INFLOW_BY_DATE ;
-drop table  "WATERDROP_DB"."ANALYZE".BSC_MONEY_OUTFLOW_BY_DATE;
-drop table "WATERDROP_DB"."ANALYZE".BSC_MONEY_NETFLOW_BY_DATE ;
-drop table "WATERDROP_DB"."ANALYZE"."BSC_CUMUL_NETFLOW_TO_DATE";
-drop table "WATERDROP_DB"."ANALYZE"."BSC_TOKENS";
-drop table "WATERDROP_DB"."ANALYZE".ETH_MONEY_INFLOW_BY_DATE ;
-drop table  "WATERDROP_DB"."ANALYZE".ETH_MONEY_OUTFLOW_BY_DATE;
-drop table "WATERDROP_DB"."ANALYZE".ETH_MONEY_NETFLOW_BY_DATE ;
-drop table "WATERDROP_DB"."ANALYZE"."ETH_CUMUL_NETFLOW_TO_DATE";
-drop table "WATERDROP_DB"."ANALYZE"."ETH_TOKENS";
-use role accountadmin;
-use schema analyze;
-show streams;
-drop stream BSC_INFLOW_INGEST_STREAM;
-drop stream BSC_NETFLOW_CUMUL_INGEST_STREAM;
-drop stream BSC_NETFLOW_INGEST_STREAM;
-drop stream BSC_OUTFLOW_INGEST_STREAM;
-drop stream BSC_TOKEN_INGEST_STREAM;
-drop stream ETH_INFLOW_INGEST_STREAM;
-drop stream ETH_NETFLOW_CUMUL_INGEST_STREAM;
-drop stream ETH_NETFLOW_INGEST_STREAM;
-drop stream ETH_OUTFLOW_INGEST_STREAM;
-drop stream ETH_TOKEN_INGEST_STREAM;
-use role sysadmin;
 
 
 create or replace table "WATERDROP_DB"."ANALYZE".BSC_MONEY_INFLOW_BY_DATE  ( token_address string, to_address string, date string, inflow real , update_time timestamp);
@@ -458,3 +428,44 @@ from
 ;
 alter task analyze.eth_wallets_ingest_task  resume;
 alter task analyze.bsc_wallets_ingest_task  resume;
+
+
+
+-- compute top wallets for each token
+
+create or replace table "WATERDROP_DB"."ANALYZE".BSC_wallet_ranks  ( token_address string, token_name string, address string, date string, rank number, ratio real, balance real, token_supply real,update_time timestamp );
+create or replace table "WATERDROP_DB"."ANALYZE".ETH_wallet_ranks  ( token_address string, token_name string, address string, date string, rank number, ratio real, balance real, token_supply real,update_time timestamp );
+
+insert into "WATERDROP_DB"."ANALYZE".bsc_wallet_ranks
+select token_address, token_name, address, date, rank() over (partition by token_address order by ratio desc) as rank_within_token, ratio, balance, token_supply,current_timestamp()
+from "WATERDROP_DB"."ANALYZE".bsc_wallets;
+
+insert into "WATERDROP_DB"."ANALYZE".eth_wallet_ranks
+select token_address, token_name, address, date, rank() over (partition by token_address order by ratio desc) as rank_within_token, ratio, balance, token_supply,current_timestamp()
+from "WATERDROP_DB"."ANALYZE".eth_wallets;
+
+create stream analyze.eth_wallets_rank_stream on table "ANALYZE".ETH_wallet_ranks;
+  create stream analyze.bsc_wallets_rank_stream on table "ANALYZE".BSC_wallet_ranks;
+ 
+ create or replace task analyze.bsc_wallets_rank_ingest_task 
+    warehouse = COMPUTE_WH
+    schedule = '60 minutes'
+    when system$stream_has_data('ANALYZE.bsc_wallets_rank_stream')
+as
+insert into "WATERDROP_DB"."ANALYZE".bsc_wallet_ranks
+select token_address, token_name, address, date, rank() over (partition by token_address order by ratio desc) as rank_within_token,
+ratio, balance, token_supply,current_timestamp()
+from "WATERDROP_DB"."ANALYZE".bsc_wallets_rank_stream;
+
+ create or replace task analyze.eth_wallets_rank_ingest_task 
+    warehouse = COMPUTE_WH
+    schedule = '60 minutes'
+    when system$stream_has_data('ANALYZE.bsc_wallets_rank_stream')
+as
+insert into "WATERDROP_DB"."ANALYZE".eth_wallet_ranks
+select token_address, token_name, address, date, rank() over (partition by token_address order by ratio desc) as rank_within_token,
+ratio, balance, token_supply,current_timestamp()
+from "WATERDROP_DB"."ANALYZE".eth_wallets_rank_stream;
+
+alter task analyze.bsc_wallets_rank_ingest_task  resume;
+alter task analyze.eth_wallets_rank_ingest_task  resume;
