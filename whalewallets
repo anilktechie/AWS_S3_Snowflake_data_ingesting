@@ -1,0 +1,392 @@
+create or replace table analyze.chain_aggr_moneytransfers (txn_hash string, timestamp number, token_address string, token_amount real, from_address string, to_address string,update_time timestamp )
+;
+insert into analyze.chain_aggr_moneytransfers
+select concat('bsc:', txnhash) as txn_hash, timestamp, concat('bsc:', tokenaddress) as token_address, tokenamount as token_amount, concat('bsc:', from_mt) as from_address, concat('bsc:', to_mt) as to_address,current_timestamp()
+from raw.bsc_moneytransfers 
+union  
+select concat('eth:', hash) as txn_hash, timestamp, concat('eth:', tokenaddress) as token_address, tokenamount as token_amount, concat('eth:', from_mt) as from_address, concat('eth:', to_mt) as to_address,current_timestamp()
+from raw.eth_moneytrans 
+
+;
+create or replace stream analyze.chain_bsc_stream on table raw.bsc_moneytransfers ;
+create or replace stream analyze.chain_eth_stream on table raw.eth_moneytrans ;
+ create or replace task analyze.chain_aggr_moneytransfers_task
+    warehouse = COMPUTE_WH
+    schedule = '60 minutes'
+    when system$stream_has_data('ANALYZE.chain_bsc_stream')
+    or system$stream_has_data('ANALYZE.chain_eth_stream')
+as
+insert into "WATERDROP_DB"."ANALYZE".chain_aggr_moneytransfers
+select concat('bsc:', txnhash) as txn_hash, timestamp, concat('bsc:', tokenaddress) as token_address, tokenamount as token_amount, concat('bsc:', from_mt) as from_address, concat('bsc:', to_mt) as to_address,current_timestamp()
+from  analyze.chain_bsc_stream
+union  
+select concat('eth:', hash) as txn_hash, timestamp, concat('eth:', tokenaddress) as token_address, tokenamount as token_amount, concat('eth:', from_mt) as from_address, concat('eth:', to_mt) as to_address,current_timestamp()
+from  analyze.chain_eth_stream
+;
+alter task analyze.chain_aggr_moneytransfers_task resume;
+
+--create flow tables
+
+
+create or replace table analyze.chain_aggr_wallet_inflow_by_date  ( token_address string, to_address string, date string, inflow real,update_time timestamp );
+insert into analyze.chain_aggr_wallet_inflow_by_date
+select token_address, to_address, date(timestamp) as date, sum(token_amount::real) as inflow,current_timestamp()
+from analyze.chain_aggr_moneytransfers
+where token_amount != 'NaN'
+group by token_address, to_address, date;
+
+create or replace stream analyze.chain_aggr_table_stream on table analyze.chain_aggr_moneytransfers;
+create or replace task analyze.chain_aggr_inflow_task
+    warehouse = COMPUTE_WH
+    schedule = '60 minutes'
+    when system$stream_has_data('ANALYZE.chain_aggr_table_stream')
+as
+insert into "WATERDROP_DB"."ANALYZE".chain_aggr_wallet_inflow_by_date
+select token_address, to_address, date(timestamp) as date, sum(token_amount::real) as inflow,current_timestamp()
+from analyze.chain_aggr_table_stream
+where token_amount != 'NaN'
+group by token_address, to_address, date;
+alter task chain_aggr_inflow_task resume;
+
+--outflow table
+
+create or replace table analyze.chain_aggr_wallet_outflow_by_date ( token_address string, from_address string, date string, outflow real,update_time timestamp );
+insert into analyze.chain_aggr_wallet_outflow_by_date
+select token_address, from_address, date(timestamp) as date, sum(token_amount::real) as outflow,current_timestamp()
+from analyze.chain_aggr_moneytransfers
+where token_amount != 'NaN'
+group by token_address, from_address, date;
+
+--use same stream with inflow table
+create or replace task analyze.chain_aggr_outflow_task
+    warehouse = COMPUTE_WH
+    schedule = '60 minutes'
+    when system$stream_has_data('ANALYZE.chain_aggr_table_stream')
+as
+insert into "WATERDROP_DB"."ANALYZE".chain_aggr_wallet_outflow_by_date
+select token_address, from_address, date(timestamp) as date, sum(token_amount::real) as outflow,current_timestamp()
+from analyze.chain_aggr_table_stream
+where token_amount != 'NaN'
+group by token_address, from_address, date;
+alter task chain_aggr_outflow_task resume;
+
+
+create or replace table analyze.chain_aggr_wallet_netflow_by_date ( token_address string, address string, date string, inflow real, outflow real, netflow real,update_time timestamp );
+insert into analyze.chain_aggr_wallet_netflow_by_date
+select
+    iff(a.token_address is not null, a.token_address, b.token_address) as token_address,
+    iff(a.from_address is not null, a.from_address, b.to_address) as address,
+    iff(a.date is not null, a.date, b.date) as date,
+    iff(b.inflow is null, 0, b.inflow) as inflow,
+    iff(a.outflow is null, 0, a.outflow) as outflow,
+    iff(a.outflow is null, b.inflow, iff(b.inflow is null, -a.outflow, b.inflow - a.outflow)) as netflow,
+    current_timestamp() 
+    from 
+    analyze.chain_aggr_wallet_outflow_by_date a 
+    FULL OUTER JOIN  
+    analyze.chain_aggr_wallet_inflow_by_date b
+    on a.from_address = b.to_address and a.token_address = b.token_address and a.date = b.date;
+    
+create or replace stream analyze.chain_inflow_stream on table analyze.chain_aggr_wallet_inflow_by_date;
+create or replace stream analyze.chain_outflow_stream on table analyze.chain_aggr_wallet_outflow_by_date;
+
+ create or replace task analyze.chain_aggr_netflow_task
+    warehouse = COMPUTE_WH
+    schedule = '60 minutes'
+    when system$stream_has_data('ANALYZE.chain_inflow_stream')
+    or system$stream_has_data('ANALYZE.chain_outflow_stream')
+as
+insert into analyze.chain_aggr_wallet_netflow_by_date
+select
+    iff(a.token_address is not null, a.token_address, b.token_address) as token_address,
+    iff(a.from_address is not null, a.from_address, b.to_address) as address,
+    iff(a.date is not null, a.date, b.date) as date,
+    iff(b.inflow is null, 0, b.inflow) as inflow,
+    iff(a.outflow is null, 0, a.outflow) as outflow,
+    iff(a.outflow is null, b.inflow, iff(b.inflow is null, -a.outflow, b.inflow - a.outflow)) as netflow,
+    current_timestamp() 
+    from 
+    analyze.chain_outflow_stream a 
+    FULL OUTER JOIN  
+    analyze.chain_inflow_stream b
+    on a.from_address = b.to_address and a.token_address = b.token_address and a.date = b.date;
+    
+    alter task analyze.chain_aggr_netflow_task resume;
+ 
+ 
+ create or replace table analyze.chain_aggr_cumul_netflow_to_date ( token_address string, address string, date string, cumul_netflow real,update_time timestamp );
+ insert into analyze.chain_aggr_cumul_netflow_to_date
+select token_address, address, date(dateadd(day, -1, current_timestamp)) as date, sum(netflow) as cumul_netflow,current_timestamp()
+from analyze.chain_aggr_wallet_netflow_by_date
+where date <= date(dateadd(day, -1, current_timestamp))
+group by token_address, address;
+
+create or replace stream  chain_aggr_netflow_bydate_stream on table analyze.chain_aggr_wallet_netflow_by_date;
+create or replace task analyze.chain_aggr_netflow_cumul_task
+    warehouse = COMPUTE_WH
+    schedule = '60 minutes'
+    when system$stream_has_data('ANALYZE.chain_aggr_netflow_bydate_stream')
+as
+insert into analyze.chain_aggr_cumul_netflow_to_date
+select token_address, address, date(dateadd(day, -1, current_timestamp)) as date, sum(netflow) as cumul_netflow,current_timestamp()
+from analyze.chain_aggr_wallet_netflow_by_date
+where date <= date(dateadd(day, -1, current_timestamp))
+group by token_address, address;
+alter task analyze.chain_aggr_netflow_cumul_task resume;
+
+
+create or replace table analyze.chain_aggr_token_supply  ( token_address string, token_supply real, decimals number, token_name string, token_symbol string,update_time timestamp );
+insert into analyze.chain_aggr_token_supply
+select tsupply.token_address as token_address, tsupply.token_supply as token_supply, tlabel.decimals as decimals, token_name as token_name, token_symbol as token_symbol,current_timestamp()
+from
+ (select token_address, sum(cumul_netflow) as token_supply
+     from analyze.chain_aggr_cumul_netflow_to_date
+     where not endswith(token_address, '0x0000000000000000000000000000000000000000') and 
+  not endswith(address, '0x0000000000000000000000000000000000000000') and cumul_netflow > 0
+     group by token_address)tsupply
+join
+    (select address as token_address, decimals, name as token_name, symbol as token_symbol
+     from public.skynet_prd_tokens)tlabel
+on tsupply.token_address = tlabel.token_address;
+
+create stream analyze.chain_aggr_cumul_todate_stream on table analyze.chain_aggr_cumul_netflow_to_date;
+create or replace task analyze.chain_aggr_tokensupply_task
+    warehouse = COMPUTE_WH
+    schedule = '60 minutes'
+    when system$stream_has_data('ANALYZE.chain_aggr_cumul_todate_stream')
+as
+insert into analyze.chain_aggr_token_supply
+select tsupply.token_address as token_address, tsupply.token_supply as token_supply, tlabel.decimals as decimals, token_name as token_name, token_symbol as token_symbol,current_timestamp()
+from
+ (select token_address, sum(cumul_netflow) as token_supply
+     from analyze.chain_aggr_cumul_todate_stream
+     where not endswith(token_address, '0x0000000000000000000000000000000000000000') and 
+  not endswith(address, '0x0000000000000000000000000000000000000000') and cumul_netflow > 0
+     group by token_address)tsupply
+join
+    (select address as token_address, decimals, name as token_name, symbol as token_symbol
+     from public.skynet_prd_tokens)tlabel
+on tsupply.token_address = tlabel.token_address;
+alter task chain_aggr_tokensupply_task resume;
+
+
+
+
+create or replace table analyze.chain_aggr_wallets  ( token_address string, token_name string, address string, address_project_name string, address_name string, date string, ratio real, balance real, token_supply real,update_time timestamp );
+insert into analyze.chain_aggr_wallets
+with temp_data as
+(
+select
+    tbalance.token_address as token_address,
+    ttokens.token_name as token_name,
+    tbalance.address as address,  
+    tbalance.date as date,
+    tbalance.cumul_netflow / ttokens.token_supply as ratio,
+    tbalance.cumul_netflow / pow(10, ttokens.decimals) as balance,
+    ttokens.token_supply / pow(10, ttokens.decimals) as token_supply,
+    current_timestamp()
+  from (
+    select * from  analyze.chain_aggr_cumul_netflow_to_date where update_time =
+    (select max(update_time) from analyze.chain_aggr_cumul_netflow_to_date) )tbalance
+  
+join (select * from analyze.chain_aggr_token_supply where update_time = (select max(update_time) from  analyze.chain_aggr_token_supply)) ttokens
+on   tbalance.token_address = ttokens.token_address
+ 
+where
+    ttokens.token_supply > 0 and
+    ttokens.token_name is not null and not endswith(tbalance.address, '0x0000000000000000000000000000000000000000'))
+    select
+    t.token_address as token_address,
+    t.token_name as token_name,
+    t.address as address,
+    tname.address_project_name as address_project_name,
+    tname.address_name as address_name,
+    t.date as date,
+    t.ratio as ratio,
+    t.balance as balance,
+    t.token_supply as token_supply,
+    current_timestamp() as update_time
+
+from temp_data t
+left join
+  (select contract_address as address, project_label as address_name, project_name as address_project_name
+   from public.prj_addr_mapping)tname on t.address = tname.address;
+   
+ create stream  ANALYZE.chain_cumul_todate_stream on table analyze.chain_aggr_cumul_netflow_to_date;
+ create or replace task analyze.chain_aggr_wallets_task
+    warehouse = COMPUTE_WH
+    schedule = '60 minutes'
+    when system$stream_has_data('ANALYZE.chain_cumul_todate_stream')
+as
+insert into analyze.chain_aggr_wallets
+with temp_data as
+(
+select
+    tbalance.token_address as token_address,
+    ttokens.token_name as token_name,
+    tbalance.address as address,  
+    tbalance.date as date,
+    tbalance.cumul_netflow / ttokens.token_supply as ratio,
+    tbalance.cumul_netflow / pow(10, ttokens.decimals) as balance,
+    ttokens.token_supply / pow(10, ttokens.decimals) as token_supply,
+    current_timestamp()
+  from (
+    select * from  analyze.chain_aggr_cumul_netflow_to_date where update_time =
+    (select max(update_time) from analyze.chain_aggr_cumul_netflow_to_date) )tbalance
+  
+join (select * from analyze.chain_aggr_token_supply where update_time = (select max(update_time) from  analyze.chain_aggr_token_supply)) ttokens
+on   tbalance.token_address = ttokens.token_address
+ 
+where
+    ttokens.token_supply > 0 and
+    ttokens.token_name is not null and not endswith(tbalance.address, '0x0000000000000000000000000000000000000000'))
+    select
+    t.token_address as token_address,
+    t.token_name as token_name,
+    t.address as address,
+    tname.address_project_name as address_project_name,
+    tname.address_name as address_name,
+    t.date as date,
+    t.ratio as ratio,
+    t.balance as balance,
+    t.token_supply as token_supply,
+    current_timestamp() as update_time
+
+from temp_data t
+left join
+  (select contract_address as address, project_label as address_name, project_name as address_project_name
+   from public.prj_addr_mapping)tname on t.address = tname.address;
+   
+   alter task analyze.chain_aggr_wallets_task resume;
+
+
+ create or replace table analyze.chain_aggr_wallet_cumul_ratio  ( token_address string, address string, date string, ratio real, cumul_ratio real, row_number number,update_time timestamp );
+insert into analyze.chain_aggr_wallet_cumul_ratio
+select
+    token_address,
+    address,
+    date,
+    ratio,
+    sum(ratio) over (partition by token_address order by ratio desc) as cumul_ratio,
+    row_number() over (partition by token_address order by ratio desc) as row_number,
+    current_timestamp()
+
+from analyze.chain_aggr_wallets a;
+
+
+create or replace stream analyze.chain_aggr_wallets_stream on table analyze.chain_aggr_wallets;
+create or replace task analyze.chain_aggr_wallets_ratio_task
+    warehouse = COMPUTE_WH
+    schedule = '60 minutes'
+    when system$stream_has_data('ANALYZE.chain_aggr_wallets_stream')
+as
+insert into analyze.chain_aggr_wallet_cumul_ratio
+select
+    token_address,
+    address,
+    date,
+    ratio,
+    sum(ratio) over (partition by token_address order by ratio desc) as cumul_ratio,
+    row_number() over (partition by token_address order by ratio desc) as row_number,
+    current_timestamp()
+
+from analyze.chain_aggr_wallets a ;
+
+alter task analyze.chain_aggr_wallets_ratio_task resume;
+
+create or replace table analyze.chain_aggr_token_concentration_stats
+( token_address string, token_name string, num_wallets_for_95_percentile_token number, top_10_wallets_token_percent real, top_50_wallets_token_percent real, top_100_wallets_token_percent real, top_200_wallets_token_percent real, number_of_wallets number,update_time timestamp);
+
+
+insert into analyze.chain_aggr_token_concentration_stats
+with temp_data as
+
+(select
+    t95.token_address as token_address,
+    t95.num_wallets_for_95_percentile_token as num_wallets_for_95_percentile_token,
+    t10.top_10_wallets_token_percent as top_10_wallets_token_percent,
+    t50.top_50_wallets_token_percent as top_50_wallets_token_percent,
+    t100.top_100_wallets_token_percent as top_100_wallets_token_percent,
+ t200.top_200_wallets_token_percent as top_200_wallets_token_percent,
+    tnwallets.number_of_wallets as number_of_wallets
+
+from (select token_address, min(row_number) as num_wallets_for_95_percentile_token from analyze.chain_aggr_wallet_cumul_ratio where cumul_ratio > 0.95 group by token_address) t95
+join (select token_address, cumul_ratio as top_10_wallets_token_percent from analyze.chain_aggr_wallet_cumul_ratio where row_number = 10) t10
+join (select token_address, cumul_ratio as top_50_wallets_token_percent from analyze.chain_aggr_wallet_cumul_ratio where row_number = 50) t50
+join (select token_address, cumul_ratio as top_100_wallets_token_percent from analyze.chain_aggr_wallet_cumul_ratio where row_number = 100) t100
+join (select token_address, cumul_ratio as top_200_wallets_token_percent from analyze.chain_aggr_wallet_cumul_ratio where row_number = 200) t200
+join (select token_address, count(*) as number_of_wallets 
+      from analyze.chain_aggr_wallets where balance > 0 group by token_address) tnwallets
+
+ on
+    t95.token_address = t10.token_address and
+    t95.token_address = t50.token_address and
+    t95.token_address = t100.token_address and
+    t95.token_address = t200.token_address and
+    t95.token_address = tnwallets.token_address
+)
+
+select
+token_address,
+tname.project_name as token_name,
+num_wallets_for_95_percentile_token,
+t.top_10_wallets_token_percent as top_10_wallets_token_percent,
+    t.top_50_wallets_token_percent as top_50_wallets_token_percent,
+    t.top_100_wallets_token_percent as top_100_wallets_token_percent,
+    t.top_200_wallets_token_percent as top_200_wallets_token_percent,
+    t.number_of_wallets as number_of_wallets,
+    current_timestamp()
+
+from (select * from temp_data) t
+join (select * from public.prj_addr_mapping) tname
+on t.token_address = tname.contract_address;
+
+create or replace stream chain_aggr_wallet_cumul_ratio_stream on table chain_aggr_wallets;
+
+create or replace task analyze.chain_aggr_wallets_cumul_ratio_task
+    warehouse = COMPUTE_WH
+    schedule = '60 minutes'
+    when system$stream_has_data('ANALYZE.chain_aggr_wallet_cumul_ratio_stream')
+as
+insert into analyze.chain_aggr_token_concentration_stats
+with temp_data as
+
+(select
+    t95.token_address as token_address,
+    t95.num_wallets_for_95_percentile_token as num_wallets_for_95_percentile_token,
+    t10.top_10_wallets_token_percent as top_10_wallets_token_percent,
+    t50.top_50_wallets_token_percent as top_50_wallets_token_percent,
+    t100.top_100_wallets_token_percent as top_100_wallets_token_percent,
+ t200.top_200_wallets_token_percent as top_200_wallets_token_percent,
+    tnwallets.number_of_wallets as number_of_wallets
+
+from (select token_address, min(row_number) as num_wallets_for_95_percentile_token from analyze.chain_aggr_wallet_cumul_ratio where cumul_ratio > 0.95 group by token_address) t95
+join (select token_address, cumul_ratio as top_10_wallets_token_percent from analyze.chain_aggr_wallet_cumul_ratio where row_number = 10) t10
+join (select token_address, cumul_ratio as top_50_wallets_token_percent from analyze.chain_aggr_wallet_cumul_ratio where row_number = 50) t50
+join (select token_address, cumul_ratio as top_100_wallets_token_percent from analyze.chain_aggr_wallet_cumul_ratio where row_number = 100) t100
+join (select token_address, cumul_ratio as top_200_wallets_token_percent from analyze.chain_aggr_wallet_cumul_ratio where row_number = 200) t200
+join (select token_address, count(*) as number_of_wallets from analyze.chain_aggr_wallets where balance > 0 group by token_address) tnwallets
+
+ on
+    t95.token_address = t10.token_address and
+    t95.token_address = t50.token_address and
+    t95.token_address = t100.token_address and
+    t95.token_address = t200.token_address and
+    t95.token_address = tnwallets.token_address
+)
+
+select
+token_address,
+tname.project_name as token_name,
+num_wallets_for_95_percentile_token,
+t.top_10_wallets_token_percent as top_10_wallets_token_percent,
+    t.top_50_wallets_token_percent as top_50_wallets_token_percent,
+    t.top_100_wallets_token_percent as top_100_wallets_token_percent,
+    t.top_200_wallets_token_percent as top_200_wallets_token_percent,
+    t.number_of_wallets as number_of_wallets,
+    current_timestamp()
+
+from (select * from temp_data) t
+join (select * from public.prj_addr_mapping) tname
+on t.token_address = tname.contract_address;
+alter task chain_aggr_wallets_cumul_ratio_task resume;
